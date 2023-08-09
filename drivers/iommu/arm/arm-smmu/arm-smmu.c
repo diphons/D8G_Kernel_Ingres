@@ -150,7 +150,7 @@ static void __arm_smmu_qcom_tlb_sync(struct iommu_domain *domain);
 static inline int arm_smmu_rpm_get(struct arm_smmu_device *smmu)
 {
 	if (pm_runtime_enabled(smmu->dev))
-		return pm_runtime_get_sync(smmu->dev);
+		return pm_runtime_resume_and_get(smmu->dev);
 
 	return 0;
 }
@@ -2507,9 +2507,11 @@ static phys_addr_t __arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
 	void __iomem *reg;
 	u32 tmp;
 	u64 phys;
-	unsigned long va;
-	int idx = cfg->cbndx;
+	unsigned long va, flags;
+	int idx  = cfg->cbndx;
+	phys_addr_t addr = 0;
 
+	spin_lock_irqsave(&smmu_domain->cb_lock, flags);
 	va = iova & ~0xfffUL;
 	if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64)
 		arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_ATS1PR, va);
@@ -2519,24 +2521,28 @@ static phys_addr_t __arm_smmu_iova_to_phys_hard(struct iommu_domain *domain,
 	reg = arm_smmu_page(smmu, ARM_SMMU_CB(smmu, idx)) + ARM_SMMU_CB_ATSR;
 	if (readl_poll_timeout_atomic(reg,tmp,
 				      !(tmp & ARM_SMMU_ATSR_ACTIVE), 5, 50)) {
+		spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 		phys = ops->iova_to_phys(ops, iova);
 		dev_err(dev,
-			"iova to phys timed out on %pad. software table walk result=%pa.\n",
-			&iova, &phys);
-		phys = 0;
-		return phys;
+
+			"iova to phys timed out on %pad. Falling back to software table walk.\n",
+			&iova);
+		arm_smmu_rpm_put(smmu);
+		return ops->iova_to_phys(ops, iova);
 	}
 
 	phys = arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_PAR);
+	spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
 	if (phys & ARM_SMMU_CB_PAR_F) {
 		dev_err(dev, "translation fault!\n");
 		dev_err(dev, "PAR = 0x%llx\n", phys);
-		phys = 0;
-	} else {
-		phys = (phys & (PHYS_MASK & ~0xfffULL)) | (iova & 0xfff);
+		goto out;
 	}
 
-	return phys;
+	addr = (phys & GENMASK_ULL(39, 12)) | (iova & 0xfff);
+out:
+
+	return addr;
 }
 
 static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
